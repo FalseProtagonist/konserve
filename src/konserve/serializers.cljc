@@ -59,7 +59,7 @@
        (binding [clojure.core/*out* output-stream]
          (pr val)))
     #?(:cljs
-         (pr-str val))))
+       (pr-str val))))
 
 (defn string-serializer []
   (map->StringSerializer {}))
@@ -81,16 +81,15 @@
 (def serializer-class->byte
   (construct->class byte->serializer))
 
-#(:clj
-  (defn construct->keys [m]
-    (->> (map (fn [[k v]] [(-> v class .getSimpleName keyword) v]) m)
-         (into {}))))
+#?(:clj
+   (defn construct->keys [m]
+     (->> (map (fn [[k v]] [(-> v class .getSimpleName keyword) v]) m)
+          (into {}))))
 
-#(:cljs
-  (defn construct->keys [m]
-    (->> (map (fn [[k v]] [(-> v type pr-str) v]) m)
-         (into {}))))
-
+#?(:cljs
+   (defn construct->keys [m]
+     (->> (map (fn [[k v]] [(-> v type pr-str) v]) m)
+          (into {}))))
 
 (def key->serializer
   (construct->keys byte->serializer))
