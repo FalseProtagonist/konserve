@@ -40,11 +40,13 @@
              read     (fress/read-object reader)]
          read))
      (-serialize [_ bytes write-handlers val]
-       (let [writer (fress/create-writer bytes
+       (let [buf   (fress/byte-stream)
+             writer (fress/create-writer buf 
                                          :handlers (merge
-                                                    custom-write-handlers
-                                                    (incognito-write-handlers write-handlers)))]
-         (fress/write-object writer val)))))
+                                                                      custom-write-handlers
+                                                                      (incognito-write-handlers write-handlers)))]
+         (fress/write-object writer val)
+         (js/Uint8Array. (.from js/Array @buf))))))
 
 (defn fressian-serializer
   ([] (fressian-serializer {} {}))

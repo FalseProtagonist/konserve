@@ -2,6 +2,7 @@
   (:require [incognito.edn :refer [read-string-safe]]
             [konserve.core :as k]
             [konserve.serializers :as ser]
+            [cljs.core.async.interop :refer-macros [<p!]]
             [konserve.protocols :refer [PEDNAsyncKeyValueStore -exists? -get -update-in -assoc-in -get-meta
                                         PBinaryAsyncKeyValueStore -bget -bassoc
                                         PStoreSerializer -serialize -deserialize]]
@@ -87,25 +88,24 @@
                       edn-meta       (meta-up old-meta)
                       edn-value      (if-not (empty? rkey)
                                        (apply update-in old rkey up-fn args)
-                                       (apply up-fn old args))]
-                  (let [up-req (.put obj-store
-                                     (clj->js {:key (pr-str fkey)
-                                               :version version
-                                               :meta
-                                               (-serialize serializer nil write-handlers edn-meta)
-                                               :edn_value
-                                               (-serialize serializer nil write-handlers edn-value)}))]
-                    (set! (.-onerror up-req)
-                          (fn [e]
-                            (put! res (ex-info "Cannot write edn value."
-                                               {:type  :write-error
-                                                :key   key-vec
-                                                :error (.-target e)}))
-                            (close! res)))
-                    (set! (.-onsuccess up-req)
-                          (fn [e]
-                            (put! res [(get-in old rkey) edn-value])
-                            (close! res)))))
+                                       (apply up-fn old args))
+                      up-req (.put obj-store (clj->js {:key (pr-str fkey)
+                                                       :version version
+                                                       :meta
+                                                       (-serialize serializer nil write-handlers edn-meta)
+                                                       :edn_value
+                                                       (-serialize serializer nil write-handlers edn-value)}))]
+                  (set! (.-onerror up-req)
+                        (fn [e]
+                          (put! res (ex-info "Cannot write edn value."
+                                             {:type  :write-error
+                                              :key   key-vec
+                                              :error (.-target e)}))
+                          (close! res)))
+                  (set! (.-onsuccess up-req)
+                        (fn [e]
+                          (put! res [(get-in old rkey) edn-value])
+                          (close! res))))
                 (catch :default e
                   (put! res (ex-info "Cannot parse edn value."
                                      {:type  :read-error
@@ -225,6 +225,41 @@
             (let [db (-> e .-target .-result)]
               (.createObjectStore db name #js {:keyPath "key"}))))
     res))
+
+
+(defn delete-indexeddb-store
+  "Delete an IndexedDB backed."
+
+  [id]
+  (let [res (async/chan)
+        req (.deleteDatabase js/window.indexedDB id)]
+    (set! (.-onerror req)
+          (fn [e]
+            (async/put! res (ex-info (str "Cannot delete " id " IndexedDB store.")
+                                     {:type :db-error
+                                      :error (.-target e)}))
+            (async/close! res)))
+    (set! (.-onsuccess req)
+          (fn success-handler []
+            (println "deleted " id)
+            (async/put! res true)))
+
+    (set! (.-onblocked req)
+          (fn blocked-handler []
+            (println "Couldn't delete " id "database due to the operation being blocked.")))
+    res))
+
+
+(defn collect-indexeddb-stores
+  "Returns a set of local indexeddb stores"
+  []
+  (go
+    (try
+      (let [raw-db-list (<p! (.databases js/window.indexedDB))
+            db-list (js->clj raw-db-list :keywordize-keys true)]
+        (set (map :name db-list)))
+      (catch js/Error err (js/console.log (ex-cause err))))))
+
 
 (comment
     ;;new-gc
