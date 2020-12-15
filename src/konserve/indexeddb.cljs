@@ -241,7 +241,6 @@
             (async/close! res)))
     (set! (.-onsuccess req)
           (fn success-handler []
-            (println "deleted " id)
             (async/put! res true)))
 
     (set! (.-onblocked req)
