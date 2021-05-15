@@ -1,10 +1,10 @@
 (ns konserve.serializers
   (:require [konserve.protocols :refer [PStoreSerializer -serialize -deserialize]]
-            #?@(:clj [[clojure.data.fressian :as fress]
                       [incognito.fressian :refer [incognito-read-handlers
-                                                  incognito-write-handlers]]])
+                                                  incognito-write-handlers]]
+            #?@(:clj [[clojure.data.fressian :as fress]])
             #?@(:cljs [[fress.api :as fress]
-                       [incognito.fressian :refer [incognito-read-handlers incognito-write-handlers]]])
+                       [clojure.string :as str]])
             [incognito.edn :refer [read-string-safe]])
   #?(:clj (:import [java.io FileOutputStream FileInputStream DataInputStream DataOutputStream]
                    [org.fressian.handlers WriteHandler ReadHandler])))
@@ -42,9 +42,8 @@
      (-serialize [_ bytes write-handlers val]
        (let [buf   (fress/byte-stream)
              writer (fress/create-writer buf 
-                                         :handlers (merge
-                                                                      custom-write-handlers
-                                                                      (incognito-write-handlers write-handlers)))]
+                                         :handlers (merge custom-write-handlers
+                                                          (incognito-write-handlers write-handlers)))]
          (fress/write-object writer val)
          (js/Uint8Array. (.from js/Array @buf))))))
 
@@ -88,13 +87,30 @@
      (->> (map (fn [[k v]] [(-> v class .getSimpleName keyword) v]) m)
           (into {}))))
 
-#?(:cljs
-   (defn construct->keys [m]
-     (->> (map (fn [[k v]] [(-> v type pr-str) v]) m)
-          (into {}))))
+;; commented because of issue below
+;; #?(:cljs (defn to-kw [inst] (-> inst type pr-str (str/split "/") (nth 1) keyword)))
 
-(def key->serializer
-  (construct->keys byte->serializer))
+;; #?(:cljs
+;;    (defn construct->keys [m]
+;;      (->> (map (fn [[k v]] [(to-kw v) v]) m)
+;;           (into {}))))
+
+;; commented because of issue below
+;; #_(:cljs
+  ;;  (defn construct->keys [m] (map #(into [] [(to-kw %1) %1]) (vals m))))
+
+#?(:clj
+   (def key->serializer
+     (construct->keys byte->serializer))
+    ;; hardcoding this because the names of classes change
+    ;; between shadow-cljs compile and shadow-cljs
+    ;; maybe the root map byte->serializer should be refactored to 3-tuples (kw, byte, serializer)
+    ;; but for now I'm just hardcoding it downstream here
+  :cljs
+   (def key->serializer 
+     {:StringSerializer (string-serializer)
+      :FressianSerializer (fressian-serializer)}))
+
 
 (defn construct->byte [m n]
   (->> (map (fn [[k0 v0] [k1 v1]] [k0 k1]) m n)

@@ -1,7 +1,15 @@
 {:deps {:aliases [:cljs]}
 
  :builds
- {:app
+ {:node
+  {:target :node-library
+   :compiler-options {:infer-externs :auto}
+   :runtime :node
+   :output-to "konserve.js"
+   :exports {:new_fs_store konserve.js/new-fs-store
+             :new_indexeddb_store konserve.js/new-indexeddb-store
+             :update_in konserve.js/update-in}}
+  :app
   {:target :browser
    :output-dir "public/js"
    :asset-path "/js"

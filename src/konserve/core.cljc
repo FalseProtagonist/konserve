@@ -6,7 +6,8 @@
             [hasch.core :refer [uuid]]
             [taoensso.timbre :as timbre :refer [trace]]
             [clojure.core.async :refer [chan poll! put! <! go]])
-  #?(:cljs (:require-macros [konserve.core :refer [go-locked]])))
+  #?(:cljs (:require-macros [konserve.core :refer [go-locked]]
+                            [cljs.core.async.macros :refer [go]])))
 
 
 ;; TODO we keep one chan for each key in memory
@@ -23,14 +24,36 @@
                                              (clojure.core/assoc old key c))))
                           key))))
 
-(defmacro go-locked [store key & code]
-  `(go
-     (let [l# (get-lock ~store ~key)]
-       (try
-         (<! l#)
-         ~@code
-         (finally
-           (put! l# :unlocked))))))
+(defn- cljs-env?
+  "Take the &env from a macro, and tell whether we are expanding into cljs."
+  [env]
+  (boolean (:ns env)))
+
+#?(:clj
+   (defmacro if-cljs
+     "Return then if we are generating cljs code and else for Clojure code.
+     https://groups.google.com/d/msg/clojurescript/iBY5HaQda4A/w1lAQi9_AwsJ"
+     [then else]
+     (if (cljs-env? &env) then else)))
+
+#?(:clj
+   (defmacro go-locked [store key & code]
+     (let [res`(if-cljs
+                (cljs.core.async.macros/go
+                  (let [l# (get-lock ~store ~key)]
+                    (try
+                      (cljs.core.async/<! l#)
+                      ~@code
+                      (finally
+                        (cljs.core.async/put! l# :unlocked)))))
+                (go
+                  (let [l# (get-lock ~store ~key)]
+                    (try
+                      (<! l#)
+                      ~@code
+                       (finally
+                        (put! l# :unlocked))))))]
+       res)))
 
 (defn exists?
   "Checks whether value is in the store."

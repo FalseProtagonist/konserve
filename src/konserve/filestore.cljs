@@ -1,439 +1,360 @@
 (ns konserve.filestore
   (:require
-   [cljs.nodejs :as node]
-   [konserve.core :as k]
+   ["fs" :as fs]
+   ["rimraf" :as rimraf]
+   [konserve.serializers :refer [byte->key byte->serializer serializer-class->byte key->serializer fressian-serializer]]
+   [konserve.encryptor :refer [null-encryptor encryptor->byte]]
+   [konserve.compressor :refer [byte->compressor, null-compressor compressor->byte]]
    [hasch.core :refer [uuid]]
-   [incognito.edn :refer [read-string-safe]]
-   [konserve.serializers :as ser]
-   [fress.api :as fress]
    [konserve.protocols :refer [PEDNAsyncKeyValueStore -exists? -get -get-meta -update-in -assoc-in -dissoc
                                PBinaryAsyncKeyValueStore -bget -bassoc
                                PStoreSerializer -serialize -deserialize]]
-   [cljs.core.async :as async :refer (take! <! >! put! take! close! chan poll!)]
-   [cljs.tools.reader.impl.inspect :as i])
+   [cljs.core.async :as async :refer [take! <! >! put! take! close! chan poll!]])
   (:require-macros [cljs.core.async.macros :refer [go go-loop]]))
-(comment
-  (defonce fs (node/require "fs"))
 
-  (defonce buffer (node/require "buffer"))
+(def version 1)
 
-  (defonce stream (node/require "stream"))
+(def header-size 8)
 
-  (defn delete-store
-    "Permanently deletes the folder of the store with all files."
-    [path]
-    (if (.existsSync fs folder)
-      (try
-        (when (.existsSync fs path)
-          (doseq [file (.readdirSync fs path)]
-            (let [file-path (str path "/" file)]
-              (when (.existsSync fs file-path)
-                (if (.isDirectory (.statSync fs file-path))
-                  (.rmdirSync fs file-path)
-                  (.unlinkSync fs file-path))))))
-        (catch js/Object err
-          (println err))
-        (finally
-          (.rmdirSync fs folder)))
-      "folder not exists"))
+(defn get-file-name [data-key folder] 
+  (str folder "/" (uuid data-key) ".ksv"))
 
-  (defn check-and-create-folder
-    "Creates Folder with given path."
-    [path]
-    (let [test-file (str path "/" (random-uuid))]
-      (try
-        (when-not (fs.existsSync path)
-          (.mkdirSync fs path))
-        (.writeFileSync fs test-file "test-data")
-        (.unlinkSync fs test-file)
-        (catch js/Object err
-          (println err)))))
+(defn translate-node-stream-channel
+  "fold-like utility function"
+  [^js/ReadStream stream data-fn result-fn error-fn]
+  (let [data-buffer (atom {:buffer nil})
+        res-ch      (chan)]
+    (.on stream "close"
+         #(do
+            (result-fn res-ch (:buffer @data-buffer))))
+    (.on  stream "error"
+          (fn [err]
+            (put! res-ch (error-fn err)) (close! res-ch)))
+    ;; provided last as this one makes it live
+    (.on stream "data"
+         #(swap! data-buffer update :buffer (data-fn %1)))
+    res-ch))
 
-  (defn delete-entry [folder key]
-    (let [file-name (uuid key)
-          path (str folder "/" file-name)
-          res-ch (chan)]
-      (.unlink fs path
-               (fn [err]
-                 (if err
-                   (if (= (aget err "code") "ENOENT")
-                     (do (put! res-ch {:type :delete-entry-error
-                                       :key  key})
-                         (close! res-ch))
-                     (throw err))
-                   (do (put! res-ch true)
-                       (close! res-ch)))))
-      res-ch))
+(defn simple-chunk-concat [byte-chunk]
+  (fn [old]
+    (if (nil? old)
+      byte-chunk
+      (js/Buffer.concat #js [old byte-chunk]))))
 
-  (def my-buf (js/Uint8Array. 1))
+(defn- combined-error [er error-msg msg]
+  (ex-info error-msg (assoc msg :exception er)))
 
-  my-buf
+(defn key-error [e msg] (combined-error e "Could not read key." msg))
 
-  (aset my-buf 0 123)
+(defn unpack-file-buffer
+  "equivalent of completion-read-handler, only thing they actually share is error handling"
+  [msg exec-fn]
+  (fn [res-ch byte-buffer]
+    (try
+      (exec-fn res-ch byte-buffer)
+      (catch js/Object e
+        #(do
+           (put! res-ch (key-error e msg)))))))
 
-  (def res-ch (chan))
+(defn exec-unpack-header-buffer [res-ch ^js/Buffer header-buffer]
+  (let [[version-byte serializer-byte compressor-byte encryptor-byte]
+        (into [] (.slice header-buffer 0 4))
+        meta-size (.readInt32BE header-buffer 4)]
+      ;; these are called ids in header-handler 
+      ;; but from the code they seem to be bytes not ids
+    (put! res-ch [version-byte serializer-byte compressor-byte meta-size])
+    res-ch))
 
-  (.open fs "/home/ferdi/foo" "r" (fn [err fd]
-                                    (if err
-                                      (if (= "ENOENT" (aget err "code"))
-                                        (put! res-ch "File Not Exists.")
-                                        (put! res-ch err))
-                                      (do (.read fs fd my-buf 0 1 3 (fn [err bytes-read buff]
-                                                                      (prn "pos: " 0 "err: " err "bytes: " bytes-read "buff " (.toString buff))))))))
+(defn get-serialization-data [path msg]
+  (let [rs (.createReadStream fs path #js {"options" #js {"end" (- header-size 1)}})
+        ch
+        (translate-node-stream-channel
+         rs
+         simple-chunk-concat
+         (unpack-file-buffer msg exec-unpack-header-buffer)
+         #(key-error %1 msg))]
+      ch))
 
-  my-buf
+(defn exec-read-fn [read-fn]
+  (fn [res-ch byte-buffer]
+    (put! res-ch (read-fn byte-buffer))))
 
-  (go (reset! fd (<! res-ch)))
+(defn get-file-size [file-name]
+  (. (.statSync fs file-name) -size))
 
-  (def fd @fd)
+(defn compose-read-fn [serializer read-handlers {:keys [compressor encryptor]}]
+  (let [apply-fn (partial -deserialize (compressor (encryptor serializer)) read-handlers)]
+    apply-fn))
 
-  (let [rs          (.createReadStream fs file-name)
-        data-buffer (atom {:buffer nil})]
-    (.on rs "data" (fn [chunk]
-                     (swap! data-buffer update :buffer (fn [old] (if (nil? old)
-                                                                   chunk
-                                                                   (js/Buffer.concat #js [old chunk]))))))
-    (.on rs "close" #(let [data (-deserialize serializer read-handlers (:buffer @data-buffer))]
-                       (put! res-ch data)
-                       (close! res-ch)))
-    (.on rs "error" (fn [err]
-                      (put! res-ch (ex-info "Could not read edn."
-                                            {:type      :read-edn-error
-                                             :key       key
-                                             :exception err}))
-                      (close! res-ch))))
-  (defn update-file [])
+(defn read-edn-data [path msg start stop read-fn]
+  (let
+   [rs   (.createReadStream
+          fs
+          path
+          #js {"start" start "end" stop})]
+    (translate-node-stream-channel
+     rs
+     simple-chunk-concat
+     (unpack-file-buffer msg (exec-read-fn read-fn))
+     #(key-error %1 msg))))
 
-  (defn- io-operation [key-vec folder config serializer read-handlers write-handlers buffer-size {:keys [operation msg] :as env}]
-    (let [[fkey & rkey] key-vec
-          file-name (str folder "/" (uuid fkey))]
-      (if (.existsSync fs file-name)
-        (let [res-ch (chan)])
-        (go (<! (update-file))))))
+(defn get-edn-meta-data [file-name read-handlers env]
+  (go (let [[_ _ _ meta-size]
+            (<! (get-serialization-data file-name {}))]
+        (<! (read-edn-data
+             file-name
+             {}
+             header-size
+             (+ meta-size header-size)
+             (compose-read-fn (fressian-serializer) read-handlers env))))))
 
-  (defrecord FileSystemNodejsStore [folder serializer read-handlers write-handlers locks config]
-    PEDNAsyncKeyValueStore
-    (-exists? [this key])
-    (-get [this key-vec])
-    (-get-meta [this key-vec])
-    (-assoc-in [this key-vec meta-up val] (-update-in this key-vec (fn [_] val)))
-    (-update-in [this key-vec meta-up up-fn up-fn-args])
-    (-dissoc [this key] (delete-entry folder key))
-    PBinaryAsyncKeyValueStore
-    (-bget [this key locked-cb])
-    (-bassoc [this key meta-up input]))
+(defn get-edn-data [file-name read-handlers env]
+  (go (let [[_ _ _ meta-size]
+            (<! (get-serialization-data file-name {}))]
+        (<! (read-edn-data
+             file-name
+             {}
+             (+ meta-size header-size)
+             (get-file-size file-name)
+             (compose-read-fn (fressian-serializer) read-handlers env))))))
 
-  (defn new-fs-store
-    "Filestore contains a Key and a Data Folder"
-    [path & {:keys [read-handlers write-handlers serializer config]
-             :or   {read-handlers  (atom {})
-                    write-handlers (atom {})
-                    serializer     (ser/fressian-serializer)
-                    config         {:fsync true}}}]
-    (let [_ (check-and-create-folder path)]
-      (go (map->FileSystemNodejsStore {:folder         path
-                                       :serializer     serializer
-                                       :read-handlers  read-handlers
-                                       :write-handlers write-handlers
-                                       :locks          (atom {})
-                                       :config         config}))))
+(defn write-bytes [bytes ^js ws error-fn]
+  (let [res-ch (chan)]
+    ;; TODO commented this, does that leave writestream open?
+    ;; (.on ws "finish" #(put! res-ch true))
+    (.on ws "error" (fn [err]
+                      (put! res-ch (error-fn err))
+                      (close! res-ch)))
+    (.write ws bytes)
+    (put! res-ch true)
+    ;; (.close ws)
+    res-ch))
 
-  #_(comment
-      ;; TODO serializer
-      ;; TODO spec konserve.core
-      (defonce fs (node/require "fs"))
+(defn inst-to-str-key [inst]
+  (pr-str (type inst)))
 
-      (defonce fs (node/require "buffer"))
+(defn simple-er [er] er)
 
-      (defonce stream (node/require "stream"))
+(defn to-byte-array
+  [version serializer compressor encryptor meta-size]
+  (let [buf (.alloc js/Buffer 8)
+        serializer-byte (serializer-class->byte (inst-to-str-key serializer))
+        compressor-byte (compressor->byte compressor)]
+    (.writeUInt8 buf version 0)
+    (.writeUInt8 buf serializer-byte 1)
+    (.writeUInt8 buf compressor-byte 2)
+    (.writeUInt8 buf (encryptor->byte encryptor) 3)
+    (.writeUInt32BE buf meta-size 4)
+    buf))
 
-      (defn delete-store
-        "Permanently deletes the folder of the store with all files."
-        [folder]
-        (if (.existsSync fs folder)
-          (try
-            (doseq [path [(str folder "/meta") (str folder "/data") folder]]
-              (when (.existsSync fs path)
-                (doseq [file (.readdirSync fs path)]
-                  (let [file-path (str path "/" file)]
-                    (when (.existsSync fs file-path)
-                      (if (.isDirectory (.statSync fs file-path))
-                        (.rmdirSync fs file-path)
-                        (.unlinkSync fs file-path)))))))
-            (catch js/Object err
-              (println err))
-            (finally
-              (.rmdirSync fs folder)))
-          "folder not exists"))
+(defn write-header [version serializer compressor encryptor meta-size ws]
+  (let [byte-array
+        (to-byte-array
+         version
+         serializer
+         compressor
+         encryptor
+         meta-size)]
+    (write-bytes
+     byte-array
+     ws
+     simple-er)))
 
-      (defn check-and-create-folder
-        "Creates Folder with given path."
-        [path]
-        (let [test-file (str path "/" (random-uuid))]
-          (try
-            (when-not (fs.existsSync path)
-              (.mkdirSync fs path))
-            (.writeFileSync fs test-file "test-data")
-            (.unlinkSync fs test-file)
-            (catch js/Object err
-              (println err)))))
+(defn write-edn
+  [serialize-fn ws value]
+  ;; I think there's no equivalent of java AsyncFileChannel's write method
+    ;; taking a start and stop byte it just writes everything
+  (write-bytes
+   (serialize-fn value)
+   ws
+   simple-er))
 
-      (defn write-edn-key [serializer write-handlers folder {:keys [key] :as meta}]
-        (let [key       (uuid (first key))
-              temp-file (str folder "/meta/" key ".new")
-              new-file  (str folder "/meta/" key)
-              fd        (.openSync fs new-file "w+")
-              _         (.closeSync fs fd)
-              ws        (.createWriteStream fs temp-file)
-              res-ch    (chan)
-              buf       (fress/byte-stream)]
-          (.on ws "close" #(try (.renameSync fs temp-file new-file)
-                                (catch js/Object err
-                                  (put! res-ch (ex-info "Could not write edn key."
-                                                        {:type      :write-edn-key-error
-                                                         :key       key
-                                                         :exception err}))
-                                  (close! res-ch))
-                                (finally (close! res-ch))))
-          (.on ws "error"
-               (fn [err]
-                 (put! res-ch (ex-info "Could not write edn key."
-                                       {:type      :write-edn-key-error
-                                        :key       key
-                                        :exception err}))
-                 (close! res-ch)))
-          (-serialize serializer buf write-handlers (update meta :key first))
-          (.write ws (js/Uint8Array. (.from js/Array @buf)))
-          (.end ws)
-          res-ch))
+(defn compose-write-fn
+  ;; -1 because cljs implementation doesn't use byte output stream
+  ;; creates their own buffer
+  [serializer write-handlers {:keys [compressor encryptor]}]
+  (fn [val] (-serialize (encryptor (compressor serializer)) -1 write-handlers val)))
 
-      (defn write-edn [serializer write-handlers read-handlers folder key up-fn up-fn-args]
-        (let [key       (uuid (first key))
-              temp-file (str folder "/data/" key ".new")
-              new-file  (str folder "/data/" key)
-              res-ch    (chan)]
-          (if (.existsSync fs new-file)
-            (let [rs          (.createReadStream fs new-file)
-                  data-buffer (atom {:buffer nil})]
-              (.on rs "data" (fn [chunk]
-                               (swap! data-buffer update :buffer (fn [old] (if (nil? old)
-                                                                             chunk
-                                                                             (js/Buffer.concat #js [old chunk]))))))
-              (.on rs "close" #(let [ws    (.createWriteStream fs temp-file)
-                                     old   (-deserialize serializer read-handlers (:buffer @data-buffer))
-                                     value (apply up-fn old up-fn-args)
-                                     buf   (fress/byte-stream)]
-                                 (.on ws "finish" (fn [_]
-                                                    (.renameSync fs temp-file new-file)
-                                                    (put! res-ch [old value])
-                                                    (close! res-ch)))
-                                 (.on ws "error"
-                                      (fn [err]
-                                        (put! res-ch (ex-info "Could not write edn."
-                                                              {:type      :write-edn-error
-                                                               :key       key
-                                                               :exception err}))
-                                        (close! res-ch)))
-                                 (-serialize serializer buf write-handlers value)
-                                 (.write ws (js/Uint8Array. (.from js/Array @buf)))
-                                 (.close ws)))
-              (.on rs "error" (fn [err]
-                                (put! res-ch (ex-info "Could not write edn."
-                                                      {:type      :write-edn-error
-                                                       :key       key
-                                                       :exception err}))
-                                (close! res-ch))))
-            (let [fd    (.openSync fs new-file "w+")
-                  _     (.closeSync fs fd)
-                  ws    (.createWriteStream fs temp-file)
-                  buf   (fress/byte-stream)
-                  value (apply up-fn nil up-fn-args)]
-              (.on ws "close" #(try
-                                 (.renameSync fs temp-file new-file)
-                                 (put! res-ch [nil value])
-                                 (close! res-ch)
-                                 (catch js/Object err
-                                   (put! res-ch (ex-info "Could not write edn."
-                                                         {:type      :write-edn-error
-                                                          :key       key
-                                                          :exception err}))
-                                   (close! res-ch))))
-              (-serialize serializer buf write-handlers value)
-              (.write ws (js/Uint8Array. (.from js/Array @buf)))
-              (.end ws)))
-          res-ch))
+(defn callback-to-chan
+  "utility function to call a node callback function that can only return an error
+    and push the (error|true) onto a channel"
+  [f & args]
+  (let [c (chan)
+        cb (fn [e] 
+             (put! c (or e true)))]
+    (apply f (concat args [cb]))
+    c))
 
-      (defn write-binary [folder key input]
-        (let [res-ch (chan)]
-          (try
-            (let [file-name (uuid key)
-                  temp-file (str folder "/data/" file-name ".new")
-                  new-file  (str folder "/data/" file-name)
-                  ws        (.createWriteStream fs temp-file)
-                  input     (if (js/Buffer.isBuffer input)
-                              (let [stream (stream.PassThrough)
-                                    _      (.end stream input)]
-                                stream)
-                              (if (instance? stream input)
-                                input
-                                (throw (js/Error. "Invalid input type"))))]
-              (.on ws "close" #(try
-                                 (.renameSync fs temp-file new-file)
-                                 (catch js/Object err
-                                   (put! res-ch (ex-info "Could not write binary."
-                                                         {:type      :write-binary-error
-                                                          :key       key
-                                                          :exception err})))
-                                 (finally
-                                   (.unpipe input ws)
-                                   (put! res-ch true)
-                                   (close! res-ch))))
-              (.on ws "error" (fn [err] (put! res-ch (ex-info "Could not write binary."
-                                                              {:type      :write-binary-error
-                                                               :key       key
-                                                               :exception err}))
-                                (close! res-ch)))
-              (.pipe input ws))
-            (catch js/Object err
-              (put! res-ch (ex-info "Could not write binary."
-                                    {:type      :write-binary-error
-                                     :key       key
-                                     :exception err}))
-              (close! res-ch)))
-          res-ch))
+(defn update-file
+;; pieced from update-file in filestore.clj and write-edn(-key) in scrap.cljs
+  "Write file into filesystem. It write first the meta-size, that is stored in (1Byte),
+  the meta-data and the actual data."
+  [folder path serializer write-handlers buffer-size
+   [key & rkey]
+   {:keys [compressor encryptor version file-name up-fn up-fn-args
+           up-fn-meta config operation input]}
+   [old-meta old-value]]
+  (let [path-new
+        (str file-name ".new")
+      ;; want to write and create
+         ;; createWriteStream should be fine
+        meta                 (up-fn-meta old-meta)
+        value                (when (= operation :write-edn)
+                               (if-not (empty? rkey)
+                                 (apply update-in old-value rkey up-fn up-fn-args)
+                                 (apply up-fn old-value up-fn-args)))
+        write-fn             (compose-write-fn serializer write-handlers {:compressor compressor :encryptor encryptor})
+        meta-bytes           (write-fn meta)
+        meta-bytes-size      (.-byteLength meta-bytes)
+        start-byte           (+ header-size meta-bytes-size)
+      ;; move fsync config into the file open
+      ;; https://github.com/nodejs/node/issues/28513
+        ws                   (if (:fsync config)
+                               (.createWriteStream fs path-new #js {"flags" "as"})
+                               (.createWriteStream fs path-new))]
+    (go
+      (<! (write-header version serializer compressor encryptor meta-bytes-size ws))
+      (<! (write-edn  write-fn ws meta))
+      (<! (if (= operation :write-binary)
+            (throw ":write-binary updating file not implemented")
+            (write-edn write-fn ws value)))
+      (.close ws)
+    ;; seems to indicate here that rename is atomic
+    ;; https://gist.github.com/coolaj86/992478/1b859936fec8b85454c5d56f9332c973a478e71b
+      (go (<! (callback-to-chan #(.rename fs %1 %2 %3) path-new file-name)))
+      (if (= operation :write-edn) [old-value value] true))))
 
-      (defn read-edn [serializer read-handlers path key]
-        (let [file-name (str path "/data/" (uuid key))
-              res-ch    (chan)]
-          (if (.existsSync fs file-name)
-            (let [rs          (.createReadStream fs file-name)
-                  data-buffer (atom {:buffer nil})]
-              (.on rs "data" (fn [chunk]
-                               (swap! data-buffer update :buffer (fn [old] (if (nil? old)
-                                                                             chunk
-                                                                             (js/Buffer.concat #js [old chunk]))))))
-              (.on rs "close" #(let [data (-deserialize serializer read-handlers (:buffer @data-buffer))]
-                                 (put! res-ch data)
-                                 (close! res-ch)))
-              (.on rs "error" (fn [err]
-                                (put! res-ch (ex-info "Could not read edn."
-                                                      {:type      :read-edn-error
-                                                       :key       key
-                                                       :exception err}))
-                                (close! res-ch))))
-            (close! res-ch))
-          res-ch))
+(defn io-operation
+  [key-vec folder serializers read-handlers write-handlers buffer-size
+   {:keys [detect-old-files operation default-serializer] :as env}]
+  (go
+    (let [key           (first key-vec)
+          msg           {:key key :operation operation}
+          file-name     (get-file-name key folder)
+          env           (assoc env :file-name file-name)
+          serializer    (get serializers default-serializer)
+          serialization-data-res
+          (<! (get-serialization-data file-name msg))
+                   ;; otherwise will be error
+          file-exists? (vector? serialization-data-res)]
+      (if file-exists?
+        (case operation
+          :read-version
+          (nth (<! (get-serialization-data file-name msg)) 0)
+          :read-serializer
+          (nth (<! (get-serialization-data file-name msg)) 1)
+          :read-meta
+          (<! (get-edn-meta-data file-name read-handlers env))
+          :read-edn
+          (<! (get-edn-data file-name read-handlers env))
+          :read-binary
+          (throw (ex-info "read-binary not implemented" {}))
+          :write-binary
+          (throw (ex-info "write-binary not implemented" {}))
+          :write-edn
+          (let [old-meta (<! (get-edn-meta-data file-name read-handlers env))
+                old-edn (<! (get-edn-data file-name read-handlers env))]
+            (<! (update-file folder file-name serializer write-handlers
+                             buffer-size key-vec env [old-meta old-edn]))))
+        (case operation
+          :write-edn
+          (<! (update-file folder file-name serializer write-handlers
+                           buffer-size key-vec env [nil nil]))
+          :write-binary
+          (throw (ex-info "write-binary not implemented" {}))
+          nil)))))
 
-      (defn read-edn-key [serializer read-handlers path key]
-        (let [file-name (str path "/meta/" key)
-              res-ch    (chan)]
-          (if (.existsSync fs file-name)
-            (let [rs          (.createReadStream fs file-name)
-                  data-buffer (atom {:buffer nil})]
-              (.on rs "data" (fn [chunk]
-                               (swap! data-buffer update :buffer (fn [old] (if (nil? old)
-                                                                             chunk
-                                                                             (js/Buffer.concat #js [old chunk]))))))
-              (.on rs "close" #(let [data    (-deserialize serializer read-handlers (:buffer @data-buffer))]
-                                 (put! res-ch data)
-                                 (close! res-ch)))
-              (.on rs "error" (fn [err]
-                                (put! res-ch (ex-info "Could not read edn key."
-                                                      {:type      :read-edn-key-error
-                                                       :key       key
-                                                       :exception err}))
-                                (close! res-ch))))
-            (close! res-ch))
-          res-ch))
+(defn check-folder-writeable [folder]
+  ;; not using uuid file as in java version because that creates 
+  ;; possibility of stochastic error
+  (go (let [
+            test-file-path (str folder "/" "test-file")
+            write-res (<! (callback-to-chan #(.writeFile fs test-file-path "test-string" #js{}%1)))
+            delete-res (<! (callback-to-chan #(.unlink fs %1 %2) test-file-path))]
+        (not (instance? js/Error write-res)))))
 
-      (defn read-binary
-        "return read stream"
-        [folder key locked-cb]
-        (let [res       (chan)
-              file-id   (uuid key)
-              file-name (str folder "/data/" file-id)]
-          (if (.existsSync fs file-name)
-            (let [size (str (aget (.statSync fs file-name) "size") " Bytes")
-                  rs   (.createReadStream fs file-name)]
-              (.on rs "close" #(do (put! res true) (close! res)))
-              (.on rs "error" (fn [err]
-                                (put! res (ex-info "Could not read binary."
-                                                   {:type      :read-binary-error
-                                                    :key       key
-                                                    :exception err}))
-                                (close! res)))
-              (go (>! res (<! (locked-cb {:read-stream rs
-                                          :file        file-name
-                                          :size        size})))
-                  (close! res)))
-            (close! res))
-          res))
 
-      (defn list-keys [{:keys [folder serializer]} read-handlers]
-        (let [filenames
-              (for [filename (filter #(re-matches #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" %) (js->clj (.readdirSync fs (str folder "/meta"))))]
-                filename)]
-          (->> filenames
-               (map #(read-edn-key serializer read-handlers folder %))
-               async/merge
-               (async/into #{}))))
+(defn check-and-create-folder [folder]
+  ;; not using uuid file as in java version because that creates 
+  ;; possibility of stochastic error
+  (go (let [mkdir-res (<! (callback-to-chan #(.mkdir fs %1 %2) folder))]
+        (<! (check-folder-writeable folder)))))
 
-      (defn delete-entry [folder file-name res-ch]
-        (let [key-file (str folder "/meta/" file-name)
-              data-file (str folder "/data/" file-name)]
-          (.unlink fs key-file
-                   (fn [err]
-                     (if err
-                       (if (= (aget err "code") "ENOENT")
-                         (do (put! res-ch "File not exist")
-                             (close! res-ch))
-                         (throw err))
-                       (do (.unlink fs data-file
-                                    (fn [err]
-                                      (if err
-                                        (throw err))))
-                           (put! res-ch true)
-                           (close! res-ch)))))))
+(defn delete-file 
+  "Remove/Delete key-value pair of Filestore by given key. If success it will return true."
+  [key folder]
+    (let [path (get-file-name key folder)]
+      (callback-to-chan #(.unlink fs %1 %2) path)))
 
-      (defrecord FileSystemNodejsStore
-                 [folder serializer read-handlers write-handlers locks config]
-        PEDNAsyncKeyValueStore
-        (-exists? [this key]
-          (let [fn  (uuid key)
-                f   (str folder "/data/" fn)
-                res (chan)]
-            (put! res (.existsSync fs f))
-            (close! res)
-            res))
-        (-get-in [this key-vec]
-          (read-edn serializer read-handlers folder (first key-vec)))
-        (-update-in [this key-vec up-fn] (-update-in this key-vec up-fn []))
-        (-update-in [this key-vec up-fn up-fn-args]
-          (go (<! (write-edn-key serializer write-handlers folder {:key key-vec :format :edn}))
-              (<! (write-edn serializer write-handlers read-handlers folder key-vec up-fn up-fn-args))))
-        (-assoc-in [this key-vec val] (-update-in this key-vec (fn [_] val)))
-        (-dissoc [this key] (let [fn (uuid key)
-                                  res-ch (chan)]
-                              (delete-entry folder fn res-ch)
-                              res-ch))
-        PBinaryAsyncKeyValueStore
-        (-bget [this key locked-cb] (read-binary folder key locked-cb))
-        (-bassoc [this key input] (do (write-edn-key serializer write-handlers folder {:key [key] :format :binary})
-                                      (write-binary folder key input))))
+(defrecord FileSystemStore [folder serializers default-serializer compressor
+                            encryptor read-handlers write-handlers buffer-size
+                            detect-old-version locks config]
+  PEDNAsyncKeyValueStore
+  (-get [this key]
+    (io-operation [key] folder serializers read-handlers write-handlers buffer-size
+                  {:operation :read-edn
+                   :compressor compressor
+                   :encryptor encryptor
+                   :format    :data
+                   :version version
+                   :default-serializer default-serializer
+                   :detect-old-files detect-old-version
+                   :msg       {:type :read-edn-error
+                               :key  key}}))
+  (-get-meta [this key]
+    (io-operation [key] folder serializers read-handlers write-handlers buffer-size
+                  {:operation :read-meta
+                   :compressor compressor
+                   :encryptor encryptor
+                   :detect-old-files detect-old-version
+                   :default-serializer default-serializer
+                   :version version
+                   :msg       {:type :read-meta-error
+                               :key  key}}))
+  (-assoc-in [this key-vec meta-up val]
+    (-update-in this key-vec meta-up (fn [_] val) []))
+  (-update-in [this key-vec meta-up up-fn args]
+    (io-operation key-vec folder serializers read-handlers write-handlers buffer-size
+                  {:operation  :write-edn
+                   :compressor compressor
+                   :encryptor encryptor
+                   :detect-old-files detect-old-version
+                   :version version
+                   :default-serializer default-serializer
+                   :up-fn      up-fn
+                   :up-fn-args args
+                   :up-fn-meta meta-up
+                   :config     config
+                   :msg        {:type :write-edn-error
+                                :key  (first key-vec)}}))
+  (-dissoc [this key]
+    (delete-file key folder)))
 
-      (defn new-fs-store
-        "Filestore contains a Key and a Data Folder"
-        [path & {:keys [read-handlers write-handlers serializer config]
-                 :or   {read-handlers  (atom {})
-                        write-handlers (atom {})
-                        serializer     (ser/fressian-serializer)
-                        config         {:fsync true}}}]
-        (let [_ (check-and-create-folder path)
-              _ (check-and-create-folder (str path "/meta"))
-              _ (check-and-create-folder (str path "/data"))]
-          (go (map->FileSystemNodejsStore {:folder         path
-                                           :serializer     serializer
-                                           :read-handlers  read-handlers
-                                           :write-handlers write-handlers
-                                           :locks          (atom {})
-                                           :config         config}))))))
+(defn new-fs-store
+  [path & {:keys [default-serializer serializers compressor encryptor
+                  read-handlers write-handlers buffer-size config detect-old-file-schema?]
+           :or   {default-serializer :FressianSerializer
+                  compressor         null-compressor
+                  encryptor          null-encryptor
+                  read-handlers      (atom {})
+                  write-handlers     (atom {})
+                  buffer-size        (* 1024 1024)
+                  config             {:fsync true}}}]
+  (let [_       (check-and-create-folder path)
+        store  (map->FileSystemStore {:detect-old-version false
+                                      :folder             path
+                                      :default-serializer default-serializer
+                                      :serializers        (merge key->serializer serializers)
+                                      :compressor         compressor
+                                      :encryptor          encryptor
+                                      :read-handlers      read-handlers
+                                      :write-handlers     write-handlers
+                                      :buffer-size        buffer-size
+                                      :locks              (atom {})
+                                      :config             config})]
+    (go store)))
+
+(defn delete-store 
+  "Permanently deletes the folder of the store with all files."
+  [folder]
+  (callback-to-chan #(rimraf folder %1)))

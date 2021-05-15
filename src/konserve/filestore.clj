@@ -19,6 +19,7 @@
     :refer [<!! <! >! chan go close! put!]]
    [taoensso.timbre :as timbre :refer [info]])
   (:import
+   [java.util Date]
    [java.io Reader File InputStream StringReader Closeable DataInput
      ByteArrayOutputStream ByteArrayInputStream FileInputStream]
    [java.nio.channels Channels FileChannel AsynchronousFileChannel CompletionHandler ReadableByteChannel FileLock]
