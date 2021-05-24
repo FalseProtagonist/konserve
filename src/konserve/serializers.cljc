@@ -4,7 +4,11 @@
                                                   incognito-write-handlers]]
             #?@(:clj [[clojure.data.fressian :as fress]])
             #?@(:cljs [[fress.api :as fress]
-                       [clojure.string :as str]])
+                       [clojure.string :as str]
+                       [hitchhiker.tree :as htree]
+                       [hitchhiker.tree.bootstrap.konserve :as h-kons]
+                       [hitchhiker.tree.messaging :as hmsg]]
+                      )
             [incognito.edn :refer [read-string-safe]])
   #?(:clj (:import [java.io FileOutputStream FileInputStream DataInputStream DataOutputStream]
                    [org.fressian.handlers WriteHandler ReadHandler])))
@@ -32,18 +36,48 @@
    (defrecord FressianSerializer [custom-read-handlers custom-write-handlers]
      PStoreSerializer
      (-deserialize [_ read-handlers bytes]
+       (println "new deserialize")
        (let [buf->arr (.from js/Array (.from js/Int8Array bytes))
              buf      (fress.impl.buffer/BytesOutputStream. buf->arr (count buf->arr))
              reader   (fress/create-reader buf
                                            :handlers (merge custom-read-handlers
-                                                            (incognito-read-handlers read-handlers)))
+                                                            (incognito-read-handlers read-handlers))
+
+                                           :record->name  {
+                                                          'hitchhiker.tree.DataNode "hitchhiker.tree.DataNode"
+                                                          'hitchhiker.tree.IndexNode "hitchhiker.tree.IndexNode"
+                                                          'hitchhiker.tree.Config "hitchhiker.tree.Config"
+                                                          'hitchhiker.tree.bootstrap.konserve.KonserveAddr "hitchhiker.tree.bootstrap.konserve.KonserveAddr"
+                                                          'hitchhiker.tree.messaging.InsertOp "hitchhiker.tree.messaging.InsertOp"
+                                                          'hitchhiker.tree.messaging.DeleteOp "hitchhiker.tree.messaging.DeleteOp"
+                                                          'hitchhiker.konserve.KonserveAddr "hitchhiker.konserve.KonserveAddr"
+                                                          'hitchhiker.tree.core.IndexNode "hitchhiker.tree.core.IndexNode"
+                                                          'hitchhiker.tree.core.DataNode "hitchhiker.tree.core.DataNode"
+                                                          'hitchhiker.tree.core.Config "hitchhiker.tree.core.Config"
+                                                          }
+
+                                           )
              read     (fress/read-object reader)]
          read))
      (-serialize [_ bytes write-handlers val]
+       (println "new serialize")
        (let [buf   (fress/byte-stream)
              writer (fress/create-writer buf 
                                          :handlers (merge custom-write-handlers
-                                                          (incognito-write-handlers write-handlers)))]
+                                                          (incognito-write-handlers write-handlers))
+                                         :name->map-ctor {'hitchhiker.tree.DataNode htree/map->DataNode
+                                                          'hitchhiker.tree.IndexNode htree/map->IndexNode
+                                                          'hitchhiker.tree.Config htree/map->Config
+                                                          'hitchhiker.tree.bootstrap.konserve.KonserveAddr h-kons/map->KonserveAddr
+                                                          'hitchhiker.tree.messaging.InsertOp hmsg/map->InsertOp
+                                                          'hitchhiker.tree.messaging.DeleteOp hmsg/map->DeleteOp
+                                                          'hitchhiker.konserve.KonserveAddr h-kons/map->KonserveAddr
+                                                          'hitchhiker.tree.core.IndexNode htree/map->IndexNode
+                                                          'hitchhiker.tree.core.DataNode htree/map->DataNode
+                                                          'hitchhiker.tree.core.Config htree/map->Config
+                                                          }
+                                         )]
+         (println "calling write-object")
          (fress/write-object writer val)
          (js/Uint8Array. (.from js/Array @buf))))))
 

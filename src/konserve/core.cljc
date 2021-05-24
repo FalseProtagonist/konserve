@@ -122,6 +122,10 @@
   value and the result of applying up-fn (the newly stored value)."
   [store key-vec up-fn & args]
   (trace "update-in on key " key)
+  #? (:cljs (try
+    (println "update-in with up-fn attempt " (up-fn nil))
+    (catch js/Object e (println "up-fn failed"))
+    ))
   (go-locked
    store (first key-vec)
    (<! (-update-in store key-vec (partial meta-update (first key-vec) :edn) up-fn args))))

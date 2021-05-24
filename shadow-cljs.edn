@@ -6,7 +6,7 @@
    :compiler-options {:infer-externs :auto}
    :runtime :node
    :output-to "konserve.js"
-   :exports {:new_fs_store konserve.js/new-fs-store
+   :exports {
              :new_indexeddb_store konserve.js/new-indexeddb-store
              :update_in konserve.js/update-in}}
   :app

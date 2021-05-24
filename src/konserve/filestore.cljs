@@ -6,6 +6,7 @@
    [konserve.encryptor :refer [null-encryptor encryptor->byte]]
    [konserve.compressor :refer [byte->compressor, null-compressor compressor->byte]]
    [hasch.core :refer [uuid]]
+   [superv.async :refer [go-try- <?-]]
    [konserve.protocols :refer [PEDNAsyncKeyValueStore -exists? -get -get-meta -update-in -assoc-in -dissoc
                                PBinaryAsyncKeyValueStore -bget -bassoc
                                PStoreSerializer -serialize -deserialize]]
@@ -120,6 +121,7 @@
 
 (defn write-bytes [bytes ^js ws error-fn]
   (let [res-ch (chan)]
+    (println "writing bytes")
     ;; TODO commented this, does that leave writestream open?
     ;; (.on ws "finish" #(put! res-ch true))
     (.on ws "error" (fn [err]
@@ -161,13 +163,52 @@
      simple-er)))
 
 (defn write-edn
-  [serialize-fn ws value]
+  [serialize-fn ws ^js value]
   ;; I think there's no equivalent of java AsyncFileChannel's write method
     ;; taking a start and stop byte it just writes everything
-  (write-bytes
-   (serialize-fn value)
-   ws
-   simple-er))
+  (println "in write-edn")
+  ;; temporal-avet, avet, eavt failed, rest passed
+  (if (:temporal-avet-key value)
+    (do (println "got temporal-avet-key")
+        (println "type " (type (:temporal-avet-key value)))
+        (try (:storage-addr (:temporal-avet-key value))
+             (catch js/Object e (println "couldn't get storage-addr" e)))
+        (try (println 
+              "type storage-addr " 
+              (type (:storage-addr (:temporal-avet-key value))))
+             (catch js/Object e (println "couldn't get type storage-addr" e)))
+
+        ;; all failed
+        (try (serialize-fn (:temporal-avet-key value))
+             (catch js/Object e (println "failed to serialize temporal-avet " e)))
+        ;; (try (serialize-fn (:temporal-eavt-key value))
+        ;;      (catch js/Object e (println "failed to serialized temporal-eavt-key")))
+        ;; (try (serialize-fn (:avet-key value))
+        ;;      (catch js/Object e (println "failed to serialize avet-key")))
+        ;; (try (serialize-fn (:eavt-key value))
+        ;;      (catch js/Object e (println "failed to serialize eavt-key")))
+        ;; (try (serialize-fn (:temporal-aevt-key value))
+        ;;      (catch js/Object e (println "failed to serialize temporal-aevt-key")))
+        ;; (try (serialize-fn (:aevt-key value))
+        ;;      (catch js/Object e (println "failed to serialized aevt")))
+
+      ;; all passed
+        ;; (try (serialize-fn (:config value))
+        ;;      (catch js/Object e (println "failed to serialize config")))
+        ;; (try (serialize-fn (:schema value))
+        ;;      (catch js/Object e (println "failed to serialize schema")))
+        ;; (try (serialize-fn (:rschema value))
+        ;;      (catch js/Object e (println "failed to serialized rschema")))
+        )
+    (do (println "didn't get temporal-avet-key")))
+  (println "got past checking for temporal-avet-key")
+  (let [serialized-value (serialize-fn value)]
+         (println "serialized the value")
+         (write-bytes
+          serialized-value
+          ws
+          simple-er))
+       )
 
 (defn compose-write-fn
   ;; -1 because cljs implementation doesn't use byte output stream
@@ -213,20 +254,38 @@
                                (.createWriteStream fs path-new #js {"flags" "as"})
                                (.createWriteStream fs path-new))]
     (go
-      (<! (write-header version serializer compressor encryptor meta-bytes-size ws))
-      (<! (write-edn  write-fn ws meta))
-      (<! (if (= operation :write-binary)
-            (throw ":write-binary updating file not implemented")
-            (write-edn write-fn ws value)))
+      (println "writing header")
+      (<! 
+       (write-header version serializer compressor encryptor meta-bytes-size ws))
+      (println "writing meta")
+      (<! 
+       (write-edn  write-fn ws meta))
+      (<! 
+       (if (= operation :write-binary)
+            (do
+              (println "write-binary called uh oh")
+              (throw ":write-binary updating file not implemented"))
+            (do
+              (println "writing data with value " value)
+              (println "extra print")
+              (println "inner " 
+                       (<!
+                        (write-edn write-fn ws value)))
+              (println "wrote data! " value)
+              )))
       (.close ws)
     ;; seems to indicate here that rename is atomic
     ;; https://gist.github.com/coolaj86/992478/1b859936fec8b85454c5d56f9332c973a478e71b
-      (go (<! (callback-to-chan #(.rename fs %1 %2 %3) path-new file-name)))
+      (println "renaming path-new" path-new "file-name " file-name)
+      (go
+        (<! 
+         (callback-to-chan #(.rename fs %1 %2 %3) path-new file-name)))
       (if (= operation :write-edn) [old-value value] true))))
 
 (defn io-operation
   [key-vec folder serializers read-handlers write-handlers buffer-size
    {:keys [detect-old-files operation default-serializer] :as env}]
+  (println "io-operation called, op " operation)
   (go
     (let [key           (first key-vec)
           msg           {:key key :operation operation}

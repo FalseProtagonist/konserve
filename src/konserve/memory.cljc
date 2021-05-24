@@ -26,9 +26,11 @@
                        (update old fkey
                                (fn [[meta data]]
                                  [(meta-up-fn meta)
-                                  (if rkey
-                                    (apply update-in data rkey up-fn args)
-                                    (apply up-fn data args))])))))]
+                                  (let [res (if rkey
+                                              (apply update-in data rkey up-fn args)
+                                              (apply up-fn data args))]
+                                    (println "update-in res " res)
+                                    res)])))))]
         [(second (get @state fkey))
          (second (get (update-atom state) fkey))])))
   (-assoc-in [this key-vec meta val] (-update-in this key-vec meta (fn [_] val) []))
